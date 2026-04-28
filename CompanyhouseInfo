@@ -1,0 +1,181 @@
+import requests
+from datetime import datetime, UTC, timedelta
+import base64
+import csv
+import time
+import os
+from dotenv import load_dotenv
+from pathlib import Path
+
+# ---------------- ENV ---------------- #
+
+env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=env_path)
+
+API_KEY = os.getenv("COMPANIES_HOUSE_API_KEY")
+
+if not API_KEY:
+    raise ValueError("Missing API key")
+
+BASE_URL = "https://api.company-information.service.gov.uk"
+
+auth_header = {
+    "Authorization": "Basic " + base64.b64encode(f"{API_KEY}:".encode()).decode()
+}
+
+cutoff_date = datetime.now(UTC) - timedelta(days=30)
+
+# ---------------- API ---------------- #
+
+def search_companies(page=0, size=100):
+    url = f"{BASE_URL}/search/companies"
+    params = {
+        "q": "ltd",
+        "start_index": page * size,
+        "items_per_page": size
+    }
+    r = requests.get(url, headers=auth_header, params=params)
+    r.raise_for_status()
+    return r.json()
+
+
+def get_company(number):
+    url = f"{BASE_URL}/company/{number}"
+    r = requests.get(url, headers=auth_header)
+    r.raise_for_status()
+    return r.json()
+
+
+def get_filings(number):
+    url = f"{BASE_URL}/company/{number}/filing-history"
+    r = requests.get(url, headers=auth_header)
+    r.raise_for_status()
+    return r.json()
+
+# ---------------- FILTERS ---------------- #
+
+def is_distressed(company):
+    accounts = company.get("accounts", {})
+    cs = company.get("confirmation_statement", {})
+
+    return accounts.get("overdue") or cs.get("overdue")
+
+
+def is_likely_large(company, filings):
+    # Structural signals of size
+
+    if company.get("company_type") == "plc":
+        return True
+
+    sic = company.get("sic_codes", [])
+    if len(sic) >= 1:
+        return True
+
+    for f in filings.get("items", []):
+        desc = f.get("description", "").lower()
+
+        if "group accounts" in desc:
+            return True
+        if "full accounts" in desc:
+            return True
+
+    return False
+
+
+def has_recent_filing_signal(filings):
+    for f in filings.get("items", []):
+        try:
+            d = datetime.strptime(f["date"], "%Y-%m-%d").replace(tzinfo=UTC)
+        except:
+            continue
+
+        if d < cutoff_date:
+            continue
+
+        desc = f.get("description", "").lower()
+
+        if "late" in desc or "overdue" in desc:
+            return True
+
+    return False
+
+# ---------------- MAIN ---------------- #
+
+def run():
+    results = []
+
+    print(f"[{datetime.now()}] 🚀 Starting acquisition shortlist scan...")
+
+    for page in range(10):  # increase for more coverage
+        print(f"\n📄 Page {page+1}/10")
+
+        data = search_companies(page)
+        items = data.get("items", [])
+
+        if not items:
+            break
+
+        for i, item in enumerate(items):
+            name = item["title"]
+            number = item["company_number"]
+
+            print(f"   [{i+1}/{len(items)}] {name}")
+
+            try:
+                company = get_company(number)
+                filings = get_filings(number)
+            except Exception as e:
+                print(f"      ⚠️ error: {e}")
+                continue
+
+            # STEP 1: must be active
+            if company.get("company_status") != "active":
+                continue
+
+            # STEP 2: must show distress
+            if not is_distressed(company):
+                continue
+
+            # STEP 3: must look meaningful size
+            if not is_likely_large(company, filings):
+                continue
+
+            # STEP 4: optional stronger signal
+            recent_signal = has_recent_filing_signal(filings)
+
+            print("      ✅ SHORTLISTED")
+
+            results.append({
+                "name": name,
+                "number": number,
+                "status": company.get("company_status"),
+                "type": company.get("company_type"),
+                "sic": ",".join(company.get("sic_codes", [])),
+                "overdue_accounts": company.get("accounts", {}).get("overdue"),
+                "overdue_cs": company.get("confirmation_statement", {}).get("overdue"),
+                "recent_late_signal": recent_signal,
+                "created": company.get("date_of_creation")
+            })
+
+            time.sleep(0.2)
+
+    print(f"\n🎯 DONE — {len(results)} shortlist candidates found")
+    return results
+
+
+def save(data):
+    if not data:
+        print("No results found")
+        return
+
+    with open("shortlist.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=data[0].keys())
+        writer.writeheader()
+        writer.writerows(data)
+
+    print("💾 saved → shortlist.csv")
+
+
+if __name__ == "__main__":
+    data = run()
+    save(data)   

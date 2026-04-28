@@ -1,0 +1,153 @@
+import csv
+import requests
+import base64
+import os
+import time
+from dotenv import load_dotenv
+from pathlib import Path
+
+# ---------------- LOAD ENV ---------------- #
+
+env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=env_path)
+
+API_KEY = os.getenv("COMPANIES_HOUSE_API_KEY")
+
+if not API_KEY:
+    raise ValueError("Missing API key in .env")
+
+BASE_URL = "https://api.company-information.service.gov.uk"
+
+auth_header = {
+    "Authorization": "Basic " + base64.b64encode(f"{API_KEY}:".encode()).decode()
+}
+
+# ---------------- API ---------------- #
+
+def get_company(number):
+    url = f"{BASE_URL}/company/{number}"
+    r = requests.get(url, headers=auth_header)
+    r.raise_for_status()
+    return r.json()
+
+
+def get_filings(number):
+    url = f"{BASE_URL}/company/{number}/filing-history"
+    r = requests.get(url, headers=auth_header)
+    r.raise_for_status()
+    return r.json()
+
+# ---------------- FINANCIAL SIGNALS ---------------- #
+
+def extract_signals(filings):
+    """
+    We extract STRUCTURAL financial indicators (not raw accounting data)
+    because Companies House does NOT provide clean equity/revenue fields.
+    """
+
+    signals = {
+        "has_group_accounts": False,
+        "has_full_accounts": False,
+        "accounts_type": None,
+        "large_company_flag": False
+    }
+
+    for f in filings.get("items", []):
+        desc = f.get("description", "").lower()
+
+        if "group accounts" in desc:
+            signals["has_group_accounts"] = True
+            signals["large_company_flag"] = True
+
+        if "full accounts" in desc:
+            signals["has_full_accounts"] = True
+
+        if "micro entity accounts" in desc:
+            signals["accounts_type"] = "micro"
+
+        if "small full accounts" in desc:
+            signals["accounts_type"] = "small"
+
+        if "medium" in desc:
+            signals["accounts_type"] = "medium"
+
+    return signals
+
+# ---------------- ENRICHMENT ---------------- #
+
+def enrich_company(number):
+    try:
+        company = get_company(number)
+        filings = get_filings(number)
+    except Exception as e:
+        print(f"❌ Error {number}: {e}")
+        return None
+
+    signals = extract_signals(filings)
+
+    accounts = company.get("accounts", {})
+    cs = company.get("confirmation_statement", {})
+
+    return {
+        "company_number": number,
+        "company_name": company.get("company_name"),
+        "status": company.get("company_status"),
+        "company_type": company.get("company_type"),
+        "incorporated": company.get("date_of_creation"),
+        "sic_codes": ",".join(company.get("sic_codes", [])),
+
+        # distress signals
+        "accounts_overdue": accounts.get("overdue"),
+        "cs_overdue": cs.get("overdue"),
+
+        # structural financial proxies
+        "accounts_type": signals["accounts_type"],
+        "has_group_accounts": signals["has_group_accounts"],
+        "has_full_accounts": signals["has_full_accounts"],
+        "large_company_flag": signals["large_company_flag"]
+    }
+
+# ---------------- MAIN ---------------- #
+
+def run(input_csv="shortlist.csv", output_csv="enriched.csv"):
+    results = []
+
+    with open(input_csv, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    print(f"🔎 Enriching {len(rows)} companies from shortlist...")
+
+    for i, row in enumerate(rows):
+        # FIX: your CSV uses "number", not "company_number"
+        number = row.get("number") or row.get("company_number")
+
+        if not number:
+            print(f"⚠️ Skipping row {i} (no company number): {row}")
+            continue
+
+        print(f"[{i+1}/{len(rows)}] {number}")
+
+        enriched = enrich_company(number)
+
+        if enriched:
+            results.append(enriched)
+
+        time.sleep(0.2)  # API safety
+
+    if not results:
+        print("No data to save.")
+        return
+
+    keys = results[0].keys()
+
+    with open(output_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(results)
+
+    print(f"\n💾 Saved → {output_csv} ({len(results)} companies)")
+
+
+if __name__ == "__main__":
+    run()
